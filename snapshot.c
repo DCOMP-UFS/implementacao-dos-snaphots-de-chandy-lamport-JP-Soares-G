@@ -3,8 +3,8 @@
  *
  *
  *
- * Compile:  mpicc -g -Wall -o parte4 parte4.c -lpthread -lrt
- * Usage:    mpiexec -n 3 ./parte4
+ * Compile:  mpicc -g -Wall -o snapshot snapshot.c -lpthread -lrt
+ * Usage:    mpiexec -n 3 ./snapshot
  */
 
 // Fazer com o snapshot comece do init snapshot, ouvir enquanto não recebe outro marcador e refatorar codigo
@@ -55,6 +55,7 @@ typedef struct canal
 Snapshot snapshot;
 
 int foiIniciadoSnapshot = 0;
+int processoIniciador = -1;
 
 Canal canais[3];
 int canaisCount = 0;
@@ -164,7 +165,7 @@ void enviaMarcadoresCanais(int pid)
     for (int i = 0; i < canaisCount; i++)
     {
 
-        if (!canais[i].jaFoiEnviadoPara)
+        if (!canais[i].jaFoiEnviadoPara && canais[i].canal != processoIniciador)
         {
             sendSnapshotMarker(pid, canais[i].canal);
             canais[i].jaFoiEnviadoPara = 1;
@@ -204,11 +205,8 @@ void Send(int remetente, int destinatario, Clock *clockPID)
     msg->remetente = remetente;
     msg->destinatario = destinatario;
 
-    //   printf("Processo %d carregando relogio (%d, %d, %d) na fila de envio\n", remetente, clockPID->p[0], clockPID->p[1], clockPID->p[2]);
-
     qSaida[qSaidaCount] = *msg;
     qSaidaCount++;
-    //   printf("qSaidaCount = %d\n", qSaidaCount);
 
     pthread_mutex_unlock(&mutexSaida);
     pthread_cond_signal(&condEmptySaida); // desbloqueia a condicional
@@ -225,7 +223,6 @@ void Receive(int pid, Clock *clockPID)
     }
 
     Clock clock = qEntrada[0]; // Consome do inicio da fila
-    // printf("Processo %d, Consumindo relogio (%d, %d, %d)\n", pid, clock.p[0], clock.p[1], clock.p[2]);
 
     for (int i = 0; i < qEntradaCount - 1; i++)
     {
@@ -233,7 +230,7 @@ void Receive(int pid, Clock *clockPID)
     }
     qEntradaCount--; // consome o relogio
 
-    pthread_mutex_lock(&mutexSnapshot);
+    pthread_mutex_lock(&mutexSnapshot); // bloqueia o mutex do snapshot
     clockPID->p[pid]++;
 
     for (int i = 0; i < 3; i++)
@@ -244,11 +241,33 @@ void Receive(int pid, Clock *clockPID)
         }
     }
     printarRelogio(clockPID, pid, 3);
-    pthread_mutex_unlock(&mutexSnapshot);
+    pthread_mutex_unlock(&mutexSnapshot); // libera o mutex do snapshot
 
     pthread_cond_signal(&condMsgFila);
     pthread_mutex_unlock(&mutexEntrada);
     pthread_cond_signal(&condFullEntrada);
+}
+
+void fazerSnapshot(int pid){
+    
+
+        if (!foiIniciadoSnapshot)
+        {
+
+            while (qEntradaCount > 0)
+            {
+                pthread_cond_wait(&condMsgFila, &mutexSnapshot);
+            }
+
+            printf("[SNAPSHOT]  Processo: %d | Marcador Recebido\n", pid);
+            snapshot.copiaClock = clockMain;
+            printf("[SNAPSHOT]  Processo: %d | Copia Local (%d, %d, %d)\n", pid, snapshot.copiaClock.p[0], snapshot.copiaClock.p[1], snapshot.copiaClock.p[2]);
+        }
+        
+        foiIniciadoSnapshot = 1;
+        enviaMarcadoresCanais(pid);
+
+        
 }
 
 void getEntrada(int pid)
@@ -259,39 +278,27 @@ void getEntrada(int pid)
     MPI_Recv(&clock, 3, MPI_INT, MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
 
     int source = status.MPI_SOURCE;
-    adicionaCanais(source, 0);
+    if(source != processoIniciador) {
+        adicionaCanais(source, 0);
+    }
+    
 
-    if (clock.p[0] == -1)
+    if (clock.p[0] == -1) // se receber um marcador 
     {
         pthread_mutex_lock(&mutexSnapshot);
-
-        if (!foiIniciadoSnapshot)
-        {
-
-            while (qEntradaCount > 0)
-            {
-                // printf("PID %d, %d\n", pid, qEntradaCount);
-                pthread_cond_wait(&condMsgFila, &mutexSnapshot);
-            }
-
-            printf("[SNAPSHOT]  Processo: %d | Marcador Recebido\n", pid);
-            snapshot.copiaClock = clockMain;
-            printf("[SNAPSHOT]  Processo: %d | Copia Local (%d, %d, %d)\n", pid, snapshot.copiaClock.p[0], snapshot.copiaClock.p[1], snapshot.copiaClock.p[2]);
-        }
-
-        foiIniciadoSnapshot = 1;
-        enviaMarcadoresCanais(pid);
-
+        fazerSnapshot(pid); // realiza o snapshot
         pthread_mutex_unlock(&mutexSnapshot);
         return;
+    }else {
+        
     }
 
     if (foiIniciadoSnapshot)
     {
-        salvarCanalComunicacao(source, clock);
+        salvarCanalComunicacao(source, clock); // salva as mensagens recebidas pela canal de comunicação
     }
 
-    pthread_mutex_lock(&mutexEntrada); // bloqueio o mutex
+    pthread_mutex_lock(&mutexEntrada); 
 
     while (qEntradaCount == BUFFER_SIZE)
     {
@@ -358,7 +365,7 @@ void *startThreadEntrada(void *args)
     {
         // printf("Processo %d, Thread Receptora...\n", (int) pid);
         getEntrada(pid);
-        sleep(1);
+        // sleep(1);
     }
     return NULL;
 }
@@ -370,8 +377,12 @@ void *startThreadMeio(void *args)
     if (p == 0)
     {
         // Clock clock0 = {{0,0,0}};
-        Event(0, &clockMain);
+        adicionaCanais(1, 0);
+        adicionaCanais(2, 0);
+        
         initSnapshot(0);
+        Event(0, &clockMain);
+        
         Send(0, 1, &clockMain);
         Receive(0, &clockMain);
         Send(0, 2, &clockMain);
@@ -381,7 +392,7 @@ void *startThreadMeio(void *args)
 
         for (int i = 0; i < canaisCount; i++)
         {
-            printarListaCanalComunicacao(snapshot.mensagens[canais[i]], canais[i], (int)p);
+            printarListaCanalComunicacao(snapshot.mensagens[canais[i].canal], canais[i].canal, (int)p);
         }
 
         printf("\n");
@@ -395,7 +406,7 @@ void *startThreadMeio(void *args)
         Receive(1, &clockMain);
         for (int i = 0; i < canaisCount; i++)
         {
-            printarListaCanalComunicacao(snapshot.mensagens[canais[i]], canais[i], (int)p);
+            printarListaCanalComunicacao(snapshot.mensagens[canais[i].canal], canais[i].canal, (int)p);
         }
         printf("\n");
     }
@@ -408,7 +419,7 @@ void *startThreadMeio(void *args)
         Receive(2, &clockMain);
         for (int i = 0; i < canaisCount; i++)
         {
-            printarListaCanalComunicacao(snapshot.mensagens[canais[i]], canais[i], (int)p);
+            printarListaCanalComunicacao(snapshot.mensagens[canais[i].canal], canais[i].canal, (int)p);
         }
         printf("\n");
     }
@@ -422,7 +433,7 @@ void *startThreadSaida(void *args)
     {
         // printf("Processo %d, Thread Emissora...\n", (int) pid);
         submitSaida();
-        sleep(1);
+        // sleep(1);
     }
     return NULL;
 }
@@ -515,20 +526,27 @@ void sendSnapshotMarker(int remetente, int destinatario)
     msg->remetente = remetente;
     msg->destinatario = destinatario; // -1 indica que é para todos os canais de comunicação
 
-    // adiciona a msg na fila
-    //   printf("Carregando mensagen do snapshot na fila de saida\n");
-    printf("[SNAPSHOT]  Processo: %d | Marcador Carregado na Fila\n", remetente);
+    
+    
+    
     qSaida[qSaidaCount] = *msg;
     qSaidaCount++;
-
+    
+    if(destinatario != remetente) {
+        printf("[SNAPSHOT]  Processo: %d | Marcador Carregado na Fila\n", remetente);
+    }else {
+        printf("[SNAPSHOT]  Iniciando...\n");
+    }
+    
     pthread_mutex_unlock(&mutexSaida);
     pthread_cond_signal(&condEmptySaida);
 }
 
 void initSnapshot(int remetente)
 { // remetente = rank
-    printf("[SNAPSHOT]  Iniciando...\n");
-    sendSnapshotMarker(remetente, -1);
+    processoIniciador = remetente;
+    sendSnapshotMarker(remetente, remetente); // coloque na fila de mensagens o inicio do snapshot 
+    // sendSnapshotMarker(remetente, -1); // depois manda o marcador para os demais
 }
 
 int main(int argc, char *argv[])
